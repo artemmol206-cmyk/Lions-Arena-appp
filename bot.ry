@@ -1,0 +1,639 @@
+"""Lions Arena Padel: Telegram-бот (MVP).
+Профиль, турниры, пары и поиск партнёра, лист ожидания, игры, уведомления, рассылка, админ-панель.
+Запуск: python bot.py (переменные окружения см. в README.md).
+"""
+import asyncio
+import logging
+import os
+import sqlite3
+from datetime import datetime, timedelta
+
+from aiogram import Bot, Dispatcher, F, Router
+from aiogram.filters import Command, CommandObject, CommandStart
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.types import (CallbackQuery, InlineKeyboardButton as IB, InlineKeyboardMarkup as IM,
+                           KeyboardButton as KB, Message, ReplyKeyboardMarkup as RM)
+
+TOKEN = os.environ["BOT_TOKEN"]
+ADMINS = {int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()}
+GROUP = os.getenv("GROUP_CHAT_ID", "")
+BOOK_URL = os.getenv("BOOKING_URL", "https://example.com")
+OFFER_MIN = int(os.getenv("OFFER_MINUTES", "45"))
+
+bot = Bot(TOKEN)
+r = Router()
+BOT_NAME = ""
+
+# ---------- база данных ----------
+db = sqlite3.connect(os.getenv("DB_PATH", "lions.db"))
+db.row_factory = sqlite3.Row
+db.executescript("""
+CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY, name TEXT, username TEXT, level TEXT, side TEXT, gender TEXT);
+CREATE TABLE IF NOT EXISTS tournaments(id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT, dt TEXT, fmt TEXT, level TEXT,
+  price INTEGER, max INTEGER, open INTEGER DEFAULT 1, status TEXT DEFAULT 'active', remind_sent INTEGER DEFAULT 0);
+CREATE TABLE IF NOT EXISTS regs(id INTEGER PRIMARY KEY AUTOINCREMENT, tid INTEGER, uid INTEGER, partner_name TEXT DEFAULT '',
+  partner_uid INTEGER, need_partner INTEGER DEFAULT 0, status TEXT DEFAULT 'in', offer_until TEXT);
+CREATE TABLE IF NOT EXISTS games(id INTEGER PRIMARY KEY AUTOINCREMENT, uid INTEGER, dt TEXT, level TEXT, have INTEGER);
+CREATE TABLE IF NOT EXISTS game_players(gid INTEGER, uid INTEGER, PRIMARY KEY(gid, uid));
+""")
+
+
+def q(sql, *a):
+    cur = db.execute(sql, a)
+    db.commit()
+    return cur.fetchall()
+
+
+def one(sql, *a):
+    rows = q(sql, *a)
+    return rows[0] if rows else None
+
+
+def ins(sql, *a):
+    cur = db.execute(sql, a)
+    db.commit()
+    return cur.lastrowid
+
+
+# ---------- вспомогательное ----------
+def kb(*rows):
+    return IM(inline_keyboard=[[IB(text=t, **({"url": d} if d.startswith("http") else {"callback_data": d})) for t, d in row]
+                               for row in rows])
+
+
+MENU_TEXTS = ["Турниры", "Найти игру", "Создать игру", "Найти партнёра", "Мой профиль", "Забронировать корт"]
+MENU = RM(keyboard=[[KB(text="Турниры"), KB(text="Найти игру")], [KB(text="Создать игру"), KB(text="Найти партнёра")],
+                    [KB(text="Мой профиль"), KB(text="Забронировать корт")]], resize_keyboard=True)
+PLEVELS = ["1.5", "2.0", "2.5", "3.0", "3.5", "4.0", "4.5"]
+GLEVELS = ["1.5–2.5", "2.5–3.0", "3.0–3.5", "3.5–4.5"]
+FORMATS = ["Mixt", "Americano", "Мужской", "Женский"]
+
+
+def is_admin(uid):
+    return uid in ADMINS
+
+
+def fdt(s):
+    return datetime.fromisoformat(s).strftime("%d.%m %H:%M")
+
+
+def uname(uid):
+    u = one("SELECT name FROM users WHERE id=?", uid)
+    return u["name"] if u else "Игрок"
+
+
+def has_profile(uid):
+    return one("SELECT 1 FROM users WHERE id=?", uid) is not None
+
+
+async def notify(uid, text, markup=None):
+    try:
+        await bot.send_message(uid, text, reply_markup=markup)
+    except Exception:
+        logging.info("не удалось отправить сообщение %s", uid)
+
+
+async def notify_admins(text):
+    for a in ADMINS:
+        await notify(a, text)
+
+
+async def reply(ev, text, markup=None):
+    if isinstance(ev, CallbackQuery):
+        try:
+            await ev.message.edit_text(text, reply_markup=markup)
+        except Exception:
+            await ev.message.answer(text, reply_markup=markup)
+        await ev.answer()
+    else:
+        await ev.answer(text, reply_markup=markup)
+
+
+# ---------- турниры: тексты и кнопки ----------
+def getT(i):
+    return one("SELECT * FROM tournaments WHERE id=?", i)
+
+
+def places(tid):
+    return one("SELECT COALESCE(SUM(1+(partner_name<>'')),0) n FROM regs WHERE tid=? AND status IN ('in','offer')", tid)["n"]
+
+
+def ttext(t):
+    w = one("SELECT COUNT(*) n FROM regs WHERE tid=? AND status='wait'", t["id"])["n"]
+    s = (f"🏆 {t['title']}\n📅 {fdt(t['dt'])}\n🎾 {t['fmt']}, уровень {t['level']}\n💰 {t['price']} ₽\n\n"
+         f"Зарегистрировано {places(t['id'])} из {t['max']} игроков")
+    if w:
+        s += f"\nВ листе ожидания: {w}"
+    if t["status"] != "active":
+        s += "\n\n❌ Турнир отменён"
+    elif not t["open"]:
+        s += "\n\n🔒 Регистрация закрыта"
+    return s
+
+
+def tkb(t, uid):
+    i, rows = t["id"], []
+    if t["status"] == "active":
+        rg = one("SELECT * FROM regs WHERE tid=? AND uid=?", i, uid)
+        if rg:
+            if rg["status"] == "in":
+                rows.append([("Отменить участие", f"t:cx:{i}")])
+            elif rg["status"] == "wait":
+                rows.append([("Выйти из листа ожидания", f"t:cx2:{i}")])
+            else:
+                rows.append([("Подтвердить место", f"t:ok:{i}"), ("Отказаться", f"t:cx2:{i}")])
+        elif t["open"]:
+            rows.append([("Встать в лист ожидания", f"t:wait:{i}")] if places(i) >= t["max"]
+                         else [("Участвовать", f"t:join:{i}")])
+    rows.append([("Участники", f"t:list:{i}")])
+    return kb(*rows)
+
+
+def label(rg):
+    s = uname(rg["uid"])
+    if rg["partner_name"]:
+        s += " + " + rg["partner_name"]
+    elif rg["need_partner"]:
+        s += " (ищет партнёра)"
+    return s
+
+
+def plist(t):
+    rs = q("SELECT * FROM regs WHERE tid=? ORDER BY id", t["id"])
+    ins_ = [label(x) for x in rs if x["status"] in ("in", "offer")]
+    wait = [label(x) for x in rs if x["status"] == "wait"]
+    s = f"Участники: {t['title']}, {fdt(t['dt'])}\n\n" + ("\n".join(f"{n}. {x}" for n, x in enumerate(ins_, 1)) or "Пока никого нет")
+    if wait:
+        s += "\n\nЛист ожидания:\n" + "\n".join(f"{n}. {x}" for n, x in enumerate(wait, 1))
+    return s
+
+
+async def add_reg(tid, uid, partner="", need=0):
+    t = getT(tid)
+    if places(tid) + (2 if partner else 1) > t["max"]:
+        return False
+    ins("INSERT INTO regs(tid,uid,partner_name,need_partner) VALUES(?,?,?,?)", tid, uid, partner, need)
+    return True
+
+
+async def promote(tid):
+    """Лист ожидания: предлагаем освободившееся место первому по очереди."""
+    t = getT(tid)
+    if not t or t["status"] != "active":
+        return
+    while True:
+        nxt = one("SELECT * FROM regs WHERE tid=? AND status='wait' ORDER BY id LIMIT 1", tid)
+        if not nxt or t["max"] - places(tid) < 1 + (1 if nxt["partner_name"] else 0):
+            return
+        until = (datetime.now() + timedelta(minutes=OFFER_MIN)).isoformat()
+        q("UPDATE regs SET status='offer', offer_until=? WHERE id=?", until, nxt["id"])
+        await notify(nxt["uid"], f"Освободилось место на турнире «{t['title']}», {fdt(t['dt'])}.\n"
+                     f"Подтвердите участие в течение {OFFER_MIN} минут, иначе место уйдёт следующему.",
+                     kb([("Подтвердить место", f"t:ok:{tid}"), ("Отказаться", f"t:cx2:{tid}")]))
+
+
+# ---------- состояния ----------
+class Prof(StatesGroup):
+    name = State(); level = State(); side = State(); gender = State()
+
+
+class Partner(StatesGroup):
+    name = State()
+
+
+class NewT(StatesGroup):
+    title = State(); dt = State(); fmt = State(); level = State(); price = State(); max = State()
+
+
+class NewG(StatesGroup):
+    dt = State(); level = State(); have = State()
+
+
+class BC(StatesGroup):
+    text = State()
+
+
+# ---------- старт и меню ----------
+@r.message(CommandStart())
+async def start(m: Message, command: CommandObject, state: FSMContext):
+    await state.clear()
+    arg = command.args or ""
+    await m.answer("Привет! Это бот Lions Arena Padel. Все действия доступны кнопками.", reply_markup=MENU)
+    if arg.startswith("t_") and arg[2:].isdigit():
+        t = getT(int(arg[2:]))
+        if t:
+            return await m.answer(ttext(t), reply_markup=tkb(t, m.from_user.id))
+    if not has_profile(m.from_user.id):
+        await start_profile(m, state)
+
+
+async def start_profile(m: Message, state: FSMContext, tid=None):
+    await state.set_state(Prof.name)
+    await state.update_data(tid=tid)
+    await m.answer("Давайте создадим профиль. Напишите ваши имя и фамилию.")
+
+
+@r.message(F.text.in_(MENU_TEXTS))
+async def menu(m: Message, state: FSMContext):
+    await state.clear()
+    uid, t = m.from_user.id, m.text
+    if t == "Забронировать корт":
+        return await m.answer("Бронирование кортов:", reply_markup=kb([("Открыть бронирование", BOOK_URL)]))
+    if not has_profile(uid):
+        return await start_profile(m, state)
+    if t == "Турниры":
+        ts = [x for x in q("SELECT * FROM tournaments WHERE status='active'") if datetime.fromisoformat(x["dt"]) > datetime.now()]
+        if not ts:
+            return await m.answer("Ближайших турниров пока нет. Мы сообщим, когда появятся.")
+        ts.sort(key=lambda x: x["dt"])
+        await m.answer("Ближайшие турниры:", reply_markup=kb(*[[(f"{fdt(x['dt'])} {x['title']} ({places(x['id'])}/{x['max']})", f"t:v:{x['id']}")] for x in ts]))
+    elif t == "Мой профиль":
+        u = one("SELECT * FROM users WHERE id=?", uid)
+        n = one("SELECT COUNT(*) n FROM regs WHERE uid=? AND status='in'", uid)["n"]
+        await m.answer(f"👤 {u['name']}\nУровень: {u['level']}\nСторона: {u['side']}\nПол: {u['gender']}\n"
+                       f"Записей на турниры: {n}", reply_markup=kb([("Изменить профиль", "pf:edit")]))
+    elif t == "Найти игру":
+        await show_games(m, uid, False)
+    elif t == "Создать игру":
+        await state.set_state(NewG.dt)
+        await m.answer("Когда игра? Напишите дату и время, например: 27.10.2026 19:00")
+    elif t == "Найти партнёра":
+        ts = [x for x in q("SELECT DISTINCT t.* FROM tournaments t JOIN regs g ON g.tid=t.id WHERE t.status='active' AND g.need_partner=1 "
+                           "AND g.status='in' AND g.partner_name=''") if datetime.fromisoformat(x["dt"]) > datetime.now()]
+        if not ts:
+            return await m.answer("Сейчас никто не ищет партнёра. Запишитесь на турнир и выберите «Мне нужен партнёр», тогда вас увидят другие.")
+        await m.answer("Выберите турнир:", reply_markup=kb(*[[(f"{fdt(x['dt'])} {x['title']}", f"p:l:{x['id']}")] for x in ts]))
+
+
+# ---------- профиль ----------
+@r.callback_query(F.data == "pf:edit")
+async def pf_edit(c: CallbackQuery, state: FSMContext):
+    await c.answer()
+    await start_profile(c.message, state)
+
+
+@r.message(Prof.name)
+async def pf_name(m: Message, state: FSMContext):
+    await state.update_data(name=(m.text or "").strip()[:60])
+    await state.set_state(Prof.level)
+    await m.answer("Ваш уровень игры:", reply_markup=kb(*[[(x, f"pl:{x}") for x in PLEVELS[i:i + 4]] for i in range(0, 7, 4)]))
+
+
+@r.callback_query(Prof.level, F.data.startswith("pl:"))
+async def pf_level(c: CallbackQuery, state: FSMContext):
+    await state.update_data(level=c.data[3:])
+    await state.set_state(Prof.side)
+    await reply(c, "Предпочтительная сторона:", kb([("Справа", "ps:Справа"), ("Слева", "ps:Слева"), ("Без разницы", "ps:Без разницы")]))
+
+
+@r.callback_query(Prof.side, F.data.startswith("ps:"))
+async def pf_side(c: CallbackQuery, state: FSMContext):
+    await state.update_data(side=c.data[3:])
+    await state.set_state(Prof.gender)
+    await reply(c, "Пол:", kb([("Мужской", "pg:Мужской"), ("Женский", "pg:Женский")]))
+
+
+@r.callback_query(Prof.gender, F.data.startswith("pg:"))
+async def pf_gender(c: CallbackQuery, state: FSMContext):
+    d = await state.get_data()
+    q("INSERT OR REPLACE INTO users VALUES(?,?,?,?,?,?)", c.from_user.id, d["name"], c.from_user.username or "", d["level"], d["side"], c.data[3:])
+    await state.clear()
+    await reply(c, "Профиль сохранён ✅")
+    if d.get("tid"):
+        t = getT(d["tid"])
+        await c.message.answer(ttext(t), reply_markup=tkb(t, c.from_user.id))
+
+
+# ---------- турниры: действия игрока ----------
+@r.callback_query(F.data.startswith("t:"))
+async def t_cb(c: CallbackQuery, state: FSMContext):
+    _, act, i = c.data.split(":")
+    i, uid = int(i), c.from_user.id
+    t = getT(i)
+    if not t:
+        return await c.answer("Турнир не найден", show_alert=True)
+    if act == "v":
+        return await reply(c, ttext(t), tkb(t, uid))
+    if act == "list":
+        return await reply(c, plist(t), kb([("Назад", f"t:v:{i}")]))
+    if t["status"] != "active":
+        return await c.answer("Турнир отменён", show_alert=True)
+    if act in ("join", "wait"):
+        if not has_profile(uid):
+            await c.answer()
+            return await start_profile(c.message, state, i)
+        if not t["open"]:
+            return await c.answer("Регистрация закрыта", show_alert=True)
+        if one("SELECT 1 FROM regs WHERE tid=? AND uid=?", i, uid):
+            return await c.answer("Вы уже записаны", show_alert=True)
+    if act == "join":
+        return await reply(c, "Как будете играть?", kb([("У меня есть партнёр", f"t:hp:{i}")], [("Мне нужен партнёр", f"t:np:{i}")]))
+    if act == "hp":
+        await state.set_state(Partner.name)
+        await state.update_data(tid=i)
+        return await reply(c, "Напишите имя и фамилию партнёра.")
+    if act == "np":
+        if not await add_reg(i, uid, "", 1):
+            return await c.answer("Мест уже нет", show_alert=True)
+        await reply(c, "Вы зарегистрированы на турнир ✅\nМы покажем вас в списке тех, кто ищет партнёра.\n\n" + ttext(getT(i)), tkb(getT(i), uid))
+    if act == "wait":
+        ins("INSERT INTO regs(tid,uid,status) VALUES(?,?,'wait')", i, uid)
+        await reply(c, "Вы в листе ожидания. Если место освободится, придёт уведомление.\n\n" + ttext(t), tkb(t, uid))
+    if act == "ok":
+        rg = one("SELECT * FROM regs WHERE tid=? AND uid=? AND status='offer'", i, uid)
+        if not rg:
+            return await c.answer("Предложение уже недействительно", show_alert=True)
+        q("UPDATE regs SET status='in', offer_until=NULL WHERE id=?", rg["id"])
+        await reply(c, "Участие подтверждено ✅\n\n" + ttext(t), tkb(t, uid))
+    if act == "cx":
+        await reply(c, f"Точно отменить участие в турнире «{t['title']}»?", kb([("Да, отменить", f"t:cx2:{i}")], [("Нет, остаюсь", f"t:v:{i}")]))
+    if act == "cx2":
+        rg = one("SELECT * FROM regs WHERE tid=? AND uid=?", i, uid)
+        if rg:
+            q("DELETE FROM regs WHERE id=?", rg["id"])
+            if rg["partner_uid"]:
+                await notify(rg["partner_uid"], f"Ваша пара отменила участие в турнире «{t['title']}».")
+            if rg["status"] == "in":
+                await notify_admins(f"{uname(uid)} отменил(а) участие в турнире «{t['title']}». Занято {places(i)} из {t['max']}.")
+            await promote(i)
+        await reply(c, "Участие отменено.\n\n" + ttext(getT(i)), tkb(getT(i), uid))
+
+
+@r.message(Partner.name)
+async def partner_name(m: Message, state: FSMContext):
+    i = (await state.get_data())["tid"]
+    await state.clear()
+    if not await add_reg(i, m.from_user.id, (m.text or "").strip()[:60]):
+        return await m.answer("Для пары не хватает мест. Можно встать в лист ожидания.")
+    await m.answer("Вы зарегистрированы на турнир ✅\n\n" + ttext(getT(i)), reply_markup=tkb(getT(i), m.from_user.id))
+
+
+# ---------- поиск партнёра ----------
+@r.callback_query(F.data.startswith("p:"))
+async def p_cb(c: CallbackQuery):
+    parts = c.data.split(":")
+    act, uid = parts[1], c.from_user.id
+    if act == "l":
+        i = int(parts[2])
+        rs = q("SELECT * FROM regs WHERE tid=? AND need_partner=1 AND status='in' AND partner_name='' AND uid<>?", i, uid)
+        if not rs:
+            return await reply(c, "Пока нет игроков, которые ищут партнёра.")
+        mine = one("SELECT id FROM regs WHERE tid=? AND uid=? AND status='in' AND partner_name=''", i, uid)
+        if not mine:
+            return await reply(c, "Сначала запишитесь на этот турнир (без партнёра), чтобы предложить пару.")
+        rows = [[(f"{uname(x['uid'])}, ур. {one('SELECT level FROM users WHERE id=?', x['uid'])['level']}: предложить сыграть", f"p:o:{mine['id']}:{x['id']}")] for x in rs]
+        return await reply(c, "Игроки, которые ищут партнёра:", kb(*rows))
+    a, b = int(parts[2]), int(parts[3])
+    ra, rb = one("SELECT * FROM regs WHERE id=?", a), one("SELECT * FROM regs WHERE id=?", b)
+    if not ra or not rb or ra["partner_name"] or rb["partner_name"]:
+        return await reply(c, "Это предложение уже недействительно.")
+    if act == "o":
+        await notify(rb["uid"], f"{uname(ra['uid'])} предлагает сыграть вместе на турнире «{getT(ra['tid'])['title']}».",
+                     kb([("Принять", f"p:y:{a}:{b}"), ("Отклонить", f"p:n:{a}:{b}")]))
+        return await reply(c, "Предложение отправлено. Мы сообщим, когда игрок ответит.")
+    if act == "y":
+        q("UPDATE regs SET partner_name=?, partner_uid=?, need_partner=0 WHERE id=?", uname(ra["uid"]), ra["uid"], b)
+        q("DELETE FROM regs WHERE id=?", a)
+        await notify(ra["uid"], f"{uname(rb['uid'])} принял(а) предложение. Вы играете в паре ✅")
+        await reply(c, "Пара сформирована ✅")
+    if act == "n":
+        await notify(ra["uid"], f"{uname(rb['uid'])} отклонил(а) предложение.")
+        await reply(c, "Предложение отклонено.")
+
+
+# ---------- обычные игры ----------
+def gcount(g):
+    return g["have"] + one("SELECT COUNT(*) n FROM game_players WHERE gid=?", g["id"])["n"]
+
+
+def gtext(g):
+    n = gcount(g)
+    names = [uname(g["uid"])] + [uname(x["uid"]) for x in q("SELECT uid FROM game_players WHERE gid=?", g["id"])]
+    s = f"🎾 Игра {fdt(g['dt'])}\nУровень {g['level']}\nСейчас {n}/4 игроков\n"
+    return s + ("✅ Игра собрана" if n >= 4 else f"Нужно ещё {4 - n}") + "\nУчастники: " + ", ".join(names)
+
+
+async def show_games(ev, uid, show_all):
+    lv = float(one("SELECT level FROM users WHERE id=?", uid)["level"])
+    gs = []
+    for g in q("SELECT * FROM games"):
+        lo, hi = (float(x) for x in g["level"].split("–"))
+        if datetime.fromisoformat(g["dt"]) > datetime.now() and gcount(g) < 4 and (show_all or lo <= lv <= hi):
+            gs.append(g)
+    gs.sort(key=lambda g: g["dt"])
+    rows = [[(f"{fdt(g['dt'])}, {gcount(g)}/4, ур. {g['level']}", f"g:v:{g['id']}")] for g in gs]
+    if not show_all:
+        rows.append([("Показать все игры", "g:all:0")])
+    await reply(ev, "Открытые игры:" if gs else "Подходящих игр пока нет. Создайте свою или посмотрите все.", kb(*rows))
+
+
+@r.message(NewG.dt)
+async def ng_dt(m: Message, state: FSMContext):
+    try:
+        d = datetime.strptime((m.text or "").strip(), "%d.%m.%Y %H:%M")
+    except ValueError:
+        return await m.answer("Не понял формат. Пример: 27.10.2026 19:00")
+    await state.update_data(dt=d.isoformat())
+    await state.set_state(NewG.level)
+    await m.answer("Уровень игроков:", reply_markup=kb([(x, f"gl:{x}") for x in GLEVELS[:2]], [(x, f"gl:{x}") for x in GLEVELS[2:]]))
+
+
+@r.callback_query(NewG.level, F.data.startswith("gl:"))
+async def ng_level(c: CallbackQuery, state: FSMContext):
+    await state.update_data(level=c.data[3:])
+    await state.set_state(NewG.have)
+    await reply(c, "Сколько человек уже есть (включая вас)?", kb([(str(n), f"gh:{n}") for n in (1, 2, 3)]))
+
+
+@r.callback_query(NewG.have, F.data.startswith("gh:"))
+async def ng_have(c: CallbackQuery, state: FSMContext):
+    d = await state.get_data()
+    await state.clear()
+    gid = ins("INSERT INTO games(uid,dt,level,have) VALUES(?,?,?,?)", c.from_user.id, d["dt"], d["level"], int(c.data[3:]))
+    await reply(c, "Игра создана ✅\n\n" + gtext(one("SELECT * FROM games WHERE id=?", gid)))
+
+
+@r.callback_query(F.data.startswith("g:"))
+async def g_cb(c: CallbackQuery):
+    _, act, i = c.data.split(":")
+    uid = c.from_user.id
+    if act == "all":
+        return await show_games(c, uid, True)
+    g = one("SELECT * FROM games WHERE id=?", int(i))
+    if not g:
+        return await c.answer("Игра не найдена", show_alert=True)
+    if act == "join" and gcount(g) < 4 and uid != g["uid"]:
+        q("INSERT OR IGNORE INTO game_players VALUES(?,?)", g["id"], uid)
+        await notify(g["uid"], f"{uname(uid)} присоединился(лась) к вашей игре {fdt(g['dt'])}.")
+        if gcount(g) >= 4:
+            for p in [g["uid"]] + [x["uid"] for x in q("SELECT uid FROM game_players WHERE gid=?", g["id"])]:
+                await notify(p, f"Игра {fdt(g['dt'])} собрана ✅ 4/4")
+    if act == "leave":
+        q("DELETE FROM game_players WHERE gid=? AND uid=?", g["id"], uid)
+    joined = one("SELECT 1 FROM game_players WHERE gid=? AND uid=?", g["id"], uid) is not None
+    btn = [("Выйти из игры", f"g:leave:{i}")] if joined else ([("Присоединиться", f"g:join:{i}")] if gcount(g) < 4 and uid != g["uid"] else [])
+    await reply(c, gtext(g), kb(*([btn] if btn else [])))
+
+
+# ---------- админ-панель ----------
+def admin_only(c):
+    return is_admin(c.from_user.id)
+
+
+@r.message(Command("admin"))
+async def admin(m: Message, state: FSMContext):
+    await state.clear()
+    if not is_admin(m.from_user.id):
+        return await m.answer("Нет доступа.")
+    await m.answer("Админ-панель:", reply_markup=kb([("Создать турнир", "a:new")], [("Управление турнирами", "a:list")]))
+
+
+@r.callback_query(F.data.startswith("a:"), admin_only)
+async def a_cb(c: CallbackQuery, state: FSMContext):
+    parts = c.data.split(":")
+    act = parts[1]
+    if act == "new":
+        await state.set_state(NewT.title)
+        return await reply(c, "Название турнира?")
+    if act == "list":
+        ts = q("SELECT * FROM tournaments WHERE status='active' ORDER BY dt")
+        return await reply(c, "Турниры:" if ts else "Активных турниров нет.", kb(*[[(f"{fdt(x['dt'])} {x['title']}", f"a:t:{x['id']}")] for x in ts]))
+    if act == "rm":
+        rg = one("SELECT * FROM regs WHERE id=?", int(parts[2]))
+        if rg:
+            q("DELETE FROM regs WHERE id=?", rg["id"])
+            await notify(rg["uid"], f"Администратор снял вас с турнира «{getT(rg['tid'])['title']}».")
+            await promote(rg["tid"])
+            parts = ["a", "pl", str(rg["tid"])]
+            act = "pl"
+    i = int(parts[2])
+    t = getT(i)
+    if act == "t":
+        return await reply(c, ttext(t), kb([("Закрыть регистрацию" if t["open"] else "Открыть регистрацию", f"a:tg:{i}")],
+                                          [("Участники", f"a:pl:{i}"), ("Написать участникам", f"a:bc:{i}")],
+                                          [("Отменить турнир", f"a:cx:{i}")], [("Назад", "a:list:0")]))
+    if act == "tg":
+        q("UPDATE tournaments SET open=? WHERE id=?", 0 if t["open"] else 1, i)
+        c.data = f"a:t:{i}"
+        return await a_cb(c, state)
+    if act == "pl":
+        rs = q("SELECT * FROM regs WHERE tid=? ORDER BY id", i)
+        rows = [[(f"Удалить: {label(x)} [{x['status']}]", f"a:rm:{x['id']}")] for x in rs] + [[("Назад", f"a:t:{i}")]]
+        return await reply(c, plist(t), kb(*rows))
+    if act == "bc":
+        await state.set_state(BC.text)
+        await state.update_data(tid=i)
+        return await reply(c, "Напишите сообщение, я отправлю его всем участникам турнира.")
+    if act == "cx":
+        return await reply(c, f"Отменить турнир «{t['title']}»? Участникам уйдёт уведомление.", kb([("Да, отменить", f"a:cx2:{i}")], [("Нет", f"a:t:{i}")]))
+    if act == "cx2":
+        q("UPDATE tournaments SET status='cancelled' WHERE id=?", i)
+        for x in q("SELECT uid FROM regs WHERE tid=?", i):
+            await notify(x["uid"], f"Турнир «{t['title']}», {fdt(t['dt'])}, отменён.")
+        await reply(c, "Турнир отменён, участники уведомлены.")
+
+
+@r.message(BC.text)
+async def bc_send(m: Message, state: FSMContext):
+    if not is_admin(m.from_user.id):
+        return
+    i = (await state.get_data())["tid"]
+    await state.clear()
+    t = getT(i)
+    rs = q("SELECT uid FROM regs WHERE tid=? AND status IN ('in','offer')", i)
+    for x in rs:
+        await notify(x["uid"], f"📢 {t['title']}, {fdt(t['dt'])}:\n\n{m.text}")
+    await m.answer(f"Отправлено: {len(rs)} участникам.")
+
+
+@r.message(NewT.title)
+async def nt_title(m: Message, state: FSMContext):
+    await state.update_data(title=m.text.strip())
+    await state.set_state(NewT.dt)
+    await m.answer("Дата и время, например: 31.10.2026 15:00")
+
+
+@r.message(NewT.dt)
+async def nt_dt(m: Message, state: FSMContext):
+    try:
+        d = datetime.strptime((m.text or "").strip(), "%d.%m.%Y %H:%M")
+    except ValueError:
+        return await m.answer("Не понял формат. Пример: 31.10.2026 15:00")
+    await state.update_data(dt=d.isoformat())
+    await state.set_state(NewT.fmt)
+    await m.answer("Формат:", reply_markup=kb([(x, f"nf:{x}") for x in FORMATS]))
+
+
+@r.callback_query(NewT.fmt, F.data.startswith("nf:"))
+async def nt_fmt(c: CallbackQuery, state: FSMContext):
+    await state.update_data(fmt=c.data[3:])
+    await state.set_state(NewT.level)
+    await reply(c, "Уровень игроков, например: 2.5–3.5")
+
+
+@r.message(NewT.level)
+async def nt_level(m: Message, state: FSMContext):
+    await state.update_data(level=m.text.strip())
+    await state.set_state(NewT.price)
+    await m.answer("Стоимость участия в рублях (число):")
+
+
+@r.message(NewT.price)
+async def nt_price(m: Message, state: FSMContext):
+    if not (m.text or "").strip().isdigit():
+        return await m.answer("Нужно число.")
+    await state.update_data(price=int(m.text))
+    await state.set_state(NewT.max)
+    await m.answer("Максимум игроков (число):")
+
+
+@r.message(NewT.max)
+async def nt_max(m: Message, state: FSMContext):
+    if not (m.text or "").strip().isdigit():
+        return await m.answer("Нужно число.")
+    d = await state.get_data()
+    await state.clear()
+    tid = ins("INSERT INTO tournaments(title,dt,fmt,level,price,max) VALUES(?,?,?,?,?,?)", d["title"], d["dt"], d["fmt"], d["level"], d["price"], int(m.text))
+    t = getT(tid)
+    post = ttext(t)
+    button = kb([("Участвовать", f"https://t.me/{BOT_NAME}?start=t_{tid}")])
+    if GROUP:
+        await bot.send_message(GROUP, post, reply_markup=button)
+        await m.answer("Турнир создан, анонс опубликован в группе ✅")
+    else:
+        await m.answer("Турнир создан ✅ GROUP_CHAT_ID не задан, перешлите анонс в группу сами:")
+        await m.answer(post, reply_markup=button)
+
+
+# ---------- фоновые задачи ----------
+async def background():
+    while True:
+        try:
+            now = datetime.now()
+            for x in q("SELECT * FROM regs WHERE status='offer' AND offer_until<?", now.isoformat()):
+                q("DELETE FROM regs WHERE id=?", x["id"])
+                await notify(x["uid"], "Время на подтверждение места вышло, предложение передано следующему игроку.")
+                await promote(x["tid"])
+            for t in q("SELECT * FROM tournaments WHERE status='active' AND remind_sent=0"):
+                if timedelta(0) < datetime.fromisoformat(t["dt"]) - now <= timedelta(hours=24):
+                    q("UPDATE tournaments SET remind_sent=1 WHERE id=?", t["id"])
+                    for x in q("SELECT uid FROM regs WHERE tid=? AND status='in'", t["id"]):
+                        await notify(x["uid"], f"⏰ Напоминание: турнир «{t['title']}» {fdt(t['dt'])}.")
+        except Exception:
+            logging.exception("ошибка фоновой задачи")
+        await asyncio.sleep(60)
+
+
+async def main():
+    global BOT_NAME
+    logging.basicConfig(level=logging.INFO)
+    BOT_NAME = (await bot.get_me()).username
+    dp = Dispatcher()
+    dp.include_router(r)
+    asyncio.create_task(background())
+    await dp.start_polling(bot)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
