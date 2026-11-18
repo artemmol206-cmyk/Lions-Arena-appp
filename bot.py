@@ -3,7 +3,8 @@ import asyncio, csv, io, logging, os, re, sqlite3
 from datetime import datetime, timedelta
 from html import escape as esc
 
-from aiogram import Bot, Dispatcher, F, Router
+from aiogram import BaseMiddleware, Bot, Dispatcher, F, Router
+from aiogram.client.session.middlewares.base import BaseRequestMiddleware
 from aiogram.client.default import DefaultBotProperties
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command, CommandObject, CommandStart
@@ -21,6 +22,7 @@ OWNERS = {int(x) for x in os.getenv("ADMIN_IDS", "").replace(" ", "").split(",")
 GROUP_ID = int(os.getenv("GROUP_ID") or 0)
 BOOKING_URL = os.getenv("BOOKING_URL", "")
 OFFER_MIN = int(os.getenv("WAITLIST_CONFIRM_MIN", "45"))
+CLEAN_AFTER = int(os.getenv("CLEAN_AFTER", "100"))  # после скольких сообщений предлагать очистку чата
 FMT = "%Y-%m-%d %H:%M"
 BOT_USERNAME = ""
 
@@ -31,7 +33,13 @@ dp = Dispatcher(storage=MemoryStorage())
 r = Router()
 
 # ───────────────────────── DB ─────────────────────────
-db = sqlite3.connect(os.getenv("DB_PATH", "lions.db"))
+DB_PATH = os.getenv("DB_PATH", "lions.db")
+try:
+    os.makedirs(os.path.dirname(DB_PATH) or ".", exist_ok=True)
+    db = sqlite3.connect(DB_PATH)
+except (OSError, sqlite3.OperationalError):
+    log.warning("Не удалось открыть %s — использую временную базу lions.db. Подключите Volume!", DB_PATH)
+    db = sqlite3.connect("lions.db")
 db.row_factory = sqlite3.Row
 db.executescript("""
 CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY, name TEXT, username TEXT, phone TEXT, level REAL, gender TEXT, side TEXT, rating INTEGER DEFAULT 0);
@@ -43,6 +51,7 @@ CREATE TABLE IF NOT EXISTS games(id INTEGER PRIMARY KEY AUTOINCREMENT, creator I
 CREATE TABLE IF NOT EXISTS game_players(gid INTEGER, uid INTEGER, PRIMARY KEY(gid, uid));
 CREATE TABLE IF NOT EXISTS polls(id INTEGER PRIMARY KEY AUTOINCREMENT, question TEXT, options TEXT);
 CREATE TABLE IF NOT EXISTS votes(pid INTEGER, uid INTEGER, name TEXT, opt INTEGER, PRIMARY KEY(pid, uid));
+CREATE TABLE IF NOT EXISTS msgs(chat INTEGER, mid INTEGER, PRIMARY KEY(chat, mid));
 """)
 
 
@@ -130,7 +139,7 @@ async def notify_tour(tid, text, statuses=("reg", "offer")):
 
 def menu(uid):
     rows = [["🏆 Турниры", "🎾 Найти игру"], ["➕ Создать игру", "🤝 Найти партнера"],
-            ["👤 Мой профиль", "📊 Рейтинг игроков"], ["📅 Забронировать корт"]]
+            ["📋 Мои мероприятия", "👤 Мой профиль"], ["📊 Рейтинг игроков", "📅 Забронировать корт"]]
     if role(uid): rows.append(["⚙️ Админ-панель"])
     return ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text=t) for t in row] for row in rows], resize_keyboard=True)
 
@@ -313,6 +322,71 @@ def profile_text(uid):
     return s
 
 
+# ───────────────────────── Очистка чата после N сообщений ─────────────────────────
+pending_clean = set()
+
+
+def track(chat, mid):
+    try:
+        db.execute("INSERT OR IGNORE INTO msgs VALUES(?,?)", (chat, mid)); db.commit()
+    except Exception:
+        pass
+
+
+class TrackOutgoing(BaseRequestMiddleware):
+    """Запоминает id всех сообщений бота в личных чатах, чтобы потом их удалить."""
+    async def __call__(self, make_request, bot, method):
+        resp = await make_request(bot, method)
+        res = getattr(resp, "result", None)
+        if isinstance(res, Message) and res.chat.type == "private":
+            track(res.chat.id, res.message_id)
+        return resp
+
+
+class CountIncoming(BaseMiddleware):
+    """Считает сообщения в чате и после CLEAN_AFTER предлагает очистить его."""
+    async def __call__(self, handler, event, data):
+        private = event.chat.type == "private"
+        if private: track(event.chat.id, event.message_id)
+        result = await handler(event, data)
+        if private and data.get("raw_state") is None and event.chat.id not in pending_clean:
+            n = q1("SELECT COUNT(*) c FROM msgs WHERE chat=?", event.chat.id)["c"]
+            if n >= CLEAN_AFTER:
+                pending_clean.add(event.chat.id)
+                await bot.send_message(event.chat.id,
+                    f"🧹 В нашем чате уже {n}+ сообщений. Очистить чат?\nПрофиль и записи сохранятся, удалятся только сообщения.",
+                    reply_markup=kb([("✅ Да", "clr:yes"), ("❌ Нет", "clr:no")]))
+        return result
+
+
+bot.session.middleware(TrackOutgoing())
+r.message.outer_middleware(CountIncoming())
+
+
+@r.callback_query(F.data == "clr:no")
+async def clr_no(c: CallbackQuery):
+    cid = c.message.chat.id; pending_clean.discard(cid)
+    ex("DELETE FROM msgs WHERE chat=?", cid)
+    await show(c, "Хорошо, оставляем всё как есть 👌"); await c.answer()
+
+
+@r.callback_query(F.data == "clr:yes")
+async def clr_yes(c: CallbackQuery):
+    cid = c.message.chat.id; pending_clean.discard(cid)
+    ids = [x["mid"] for x in q("SELECT mid FROM msgs WHERE chat=?", cid)]
+    ex("DELETE FROM msgs WHERE chat=?", cid)
+    await c.answer("Чищу чат…")
+    for i in range(0, len(ids), 100):
+        chunk = ids[i:i + 100]
+        try:
+            await bot.delete_messages(cid, chunk)
+        except Exception:
+            for mid in chunk:
+                try: await bot.delete_message(cid, mid)
+                except Exception: pass
+    await bot.send_message(cid, "🧹 Чат очищен. Профиль и записи на мероприятия сохранены.", reply_markup=menu(c.from_user.id))
+
+
 # ───────────────────────── Главное меню ─────────────────────────
 @r.message(CommandStart())
 async def start(m: Message, state: FSMContext, command: CommandObject):
@@ -366,6 +440,35 @@ async def m_book(m: Message, state: FSMContext):
     await state.clear()
     if BOOKING_URL: await m.answer("Бронирование кортов Lions Arena:", reply_markup=kb([("📅 Открыть бронирование", BOOKING_URL)]))
     else: await m.answer("Ссылка на бронирование скоро появится.")
+
+
+# ───────────────────────── Мои мероприятия ─────────────────────────
+@r.message(F.text == "📋 Мои мероприятия")
+async def m_mine(m: Message, state: FSMContext):
+    if not await guard(m, state): return
+    uid = m.from_user.id; t0 = now()
+    ts = q("SELECT t.*, g.status AS rs, g.partner AS rp FROM regs g JOIN tournaments t ON t.id=g.tid "
+           "WHERE g.uid=? AND t.status!='cancelled' AND t.start>? ORDER BY t.start", uid, t0)
+    gs = q("SELECT g.* FROM game_players p JOIN games g ON g.id=p.gid WHERE p.uid=? AND g.start>? ORDER BY g.start", uid, t0)
+    if not ts and not gs:
+        return await m.answer("📋 Вы пока никуда не записаны.\nЗагляните в «🏆 Турниры» или «🎾 Найти игру» 🙌")
+    label = {"reg": "✅ участвую", "wait": "⏳ лист ожидания", "offer": "🔔 подтвердите место"}
+    text, rows = "📋 <b>Мои мероприятия</b>\n", []
+    if ts:
+        text += "\n🏆 <b>Турниры</b>\n"
+        for t in ts:
+            extra = ""
+            if t["rp"]: extra = f" · пара: {esc(user(t['rp'])['name'])}"
+            elif t["rs"] == "reg": extra = " · 🔎 ищу партнёра"
+            text += f"• {fmt(t['start'])} — {esc(t['title'])} — {label[t['rs']]}{extra}\n"
+            rows.append([(f"🏆 {fmt(t['start'])[:10]} · {t['title']}", f"tv:{t['id']}")])
+    if gs:
+        text += "\n🎾 <b>Игры</b>\n"
+        for g in gs:
+            st = "✅ игра собрана" if gcount(g) >= 4 else f"набрано {gcount(g)}/4"
+            text += f"• {fmt(g['start'])} — {st}\n"
+            rows.append([(f"🎾 {fmt(g['start'])}", f"gv:{g['id']}")])
+    await m.answer(text + "\nНажмите на мероприятие, чтобы открыть его.", reply_markup=kb(*rows))
 
 
 # ───────────────────────── Турнир: запись ─────────────────────────
